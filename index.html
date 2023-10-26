@@ -1,0 +1,150 @@
+<html>
+  <iframe
+    id="wp"
+    style="width: 100%; height: 90%; border: 1px solid #ccc"
+  ></iframe>
+  <script type="module">
+    // Use unpkg for convenience
+    import { startPlaygroundWeb } from "https://unpkg.com/@wp-playground/client/index.js";
+    import {
+      activateTheme,
+      login,
+    } from "https://unpkg.com/@wp-playground/blueprints/index.js";
+
+    const client = await startPlaygroundWeb({
+      iframe: document.getElementById("wp"),
+      remoteUrl: `https://playground.wordpress.net/remote.html`,
+    });
+
+    import { Octokit } from "https://esm.sh/@octokit/rest";
+    import { createPullRequest } from "https://cdn.pika.dev/octokit-plugin-create-pull-request";
+    const MyOctokit = Octokit.plugin(createPullRequest);
+    const octokit = new MyOctokit({
+      auth: "",
+    });
+
+    const { data: pullRequest } = await octokit.rest.pulls.get({
+      owner: "Automattic",
+      repo: "themes",
+      pull_number: "7434",
+    });
+
+    const { data: files } = await octokit.rest.pulls.listFiles({
+      owner: "Automattic",
+      repo: "themes",
+      pull_number: "7434",
+    });
+
+    function findThemeDirectories(files) {
+      const uniqueDirectories = new Set();
+
+      for (let i = 0; i < files.length; i++) {
+        const dir = files[i].filename.split("/")[0];
+        uniqueDirectories.add(dir);
+      }
+      return Array.from(uniqueDirectories);
+    }
+    const themeDirs = findThemeDirectories(files);
+
+    const CONCURRENCY_LIMIT = 15;
+
+    const themeFiles = await getFilesFromDirectory(
+      "Automattic",
+      "themes",
+      pullRequest.head.ref,
+      themeDirs[0]
+    );
+
+    async function getFilesFromDirectory(owner, repo, ref, path) {
+      let allFiles = [];
+
+      try {
+        // Fetch the content of the directory
+        const { data: content } = await octokit.repos.getContent({
+          owner,
+          repo,
+          path,
+          ref,
+        });
+
+        const filePromises = [];
+        for (const item of content) {
+          if (item.type === "file") {
+            filePromises.push(getFileContent(owner, repo, ref, item));
+            if (filePromises.length >= CONCURRENCY_LIMIT) {
+              const results = await Promise.all(filePromises);
+              allFiles.push(...results);
+              filePromises.length = 0; // Clear the array
+            }
+          } else if (item.type === "dir") {
+            const filesInSubdir = await getFilesFromDirectory(
+              owner,
+              repo,
+              ref,
+              item.path
+            );
+            allFiles = allFiles.concat(filesInSubdir);
+          }
+        }
+
+        // Process remaining file promises
+        if (filePromises.length > 0) {
+          const results = await Promise.all(filePromises);
+          allFiles.push(...results);
+        }
+      } catch (error) {
+        console.error("Error fetching files:", error);
+      }
+
+      return allFiles;
+    }
+
+    async function getFileContent(owner, repo, ref, item) {
+      const { data: fileContent } = await octokit.repos.getContent({
+        owner,
+        repo,
+        ref,
+        path: item.path,
+      });
+      return {
+        name: item.name,
+        path: item.path,
+        content: base64ToUint8Array(fileContent.content),
+      };
+    }
+
+    function base64ToUint8Array(base64) {
+      var binaryString = window.atob(base64); // This will convert base64 to binary string
+      var len = binaryString.length;
+      var bytes = new Uint8Array(len);
+      for (var i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    // Let's wait until Playground is fully loaded
+    await client.isReady();
+    console.log("Playground is ready!");
+
+    for (const file of themeFiles) {
+      const filePath = `/wordpress/wp-content/themes/${file.path}`;
+      const parentPath = filePath.split("/").slice(0, -1).join("/");
+      await client.mkdirTree(parentPath);
+      await client.writeFile(filePath, file.content);
+    }
+
+    await activateTheme(client, {
+      step: "activateTheme",
+      themeFolderName: themeDirs[0],
+    });
+
+    await login(client, {
+      step: "login",
+      username: "admin",
+      password: "password",
+    });
+
+    client.goTo("/wp-admin/site-editor.php");
+  </script>
+</html>
